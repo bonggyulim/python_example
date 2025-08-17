@@ -32,12 +32,11 @@ def create_app():
     @app.post("/notes")
     def create_note():
         data = request.get_json(silent=True) or {}
-        id_ = data.get("id")
+        data.pop("id", None)  # 클라이언트가 ID를 보내면 무시
         note = Note(
-            id=id_,
             title=data.get("title", ""),
             content=data.get("content", ""),
-            created_date=data.get("createdDate") or Note.now_iso()
+            created_date=data.get("createdDate")
         )
 
         db.session.add(note)
@@ -45,8 +44,13 @@ def create_app():
             db.session.commit()
         except IntegrityError:
             db.session.rollback()
-            return jsonify({"message": "ID already exists"}), 409
-        return jsonify(to_dto(note)), 201
+            return jsonify({"message": "Integrity error"}), 409
+        return jsonify({
+            "id": note.id,  # 서버가 생성한 PK
+            "title": note.title,
+            "content": note.content,
+            "createdDate": note.created_date
+        }), 201
         
     @app.after_request
     def force_close_connection(response):
