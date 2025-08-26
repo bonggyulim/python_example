@@ -3,6 +3,8 @@ import os
 from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
 from models import db, Note
+from note_summarize_model import summarize_text
+from sentiment_model import classify_sentiment
 from sqlalchemy.exc import IntegrityError
 
 def create_app():
@@ -25,7 +27,9 @@ def create_app():
             "id": note.id,
             "title": note.title,
             "content": note.content,
-            "createdDate": note.created_date,  # Android DTO와 키 맞춤
+            "summarize": note.summarize,
+            "sentiment": note.sentiment,
+            "createdDate": note.createdDate # ISO 8601 문자열
         }
 
     # [C] Create
@@ -33,13 +37,27 @@ def create_app():
     def create_note():
         data = request.get_json(silent=True) or {}
         data.pop("id", None)  # 클라이언트가 ID를 보내면 무시
+
+        try:
+            summary = summarize_text(data.get("content", "")) or ""
+        except:
+            summary = ""
+
+        try:
+            sentiment = float(classify_sentiment(data.get("content", "")))
+        except:
+            sentiment = 0.0
+        
         note = Note(
             title=data.get("title", ""),
             content=data.get("content", ""),
-            created_date=data.get("createdDate")
+            summarize=summary,
+            sentiment=sentiment,
+            createdDate=data.get("createdDate", "")
         )
 
         db.session.add(note)
+
         try:
             db.session.commit()
         except IntegrityError:
@@ -49,19 +67,15 @@ def create_app():
             "id": note.id,  # 서버가 생성한 PK
             "title": note.title,
             "content": note.content,
-            "createdDate": note.created_date
-        }), 201
+            "createdDate": note.createdDate
+        })
         
-    @app.after_request
-    def force_close_connection(response):
-        response.headers["Connection"] = "close"
-        return response
 
     # [R] Read all (간단 목록)
     @app.get("/notes")
     def list_notes():
         notes = Note.query.order_by(Note.id.desc()).all()
-        return jsonify([to_dto(n) for n in notes]), 200
+        return jsonify([to_dto(n) for n in notes])
 
     # [R] Read one
     @app.get("/notes/<int:note_id>")
@@ -69,7 +83,7 @@ def create_app():
         note = Note.query.get(note_id)
         if not note:
             abort(404, description="Note not found")
-        return jsonify(to_dto(note)), 200
+        return jsonify(to_dto(note))
 
     # [U] Update
     @app.put("/notes/<int:note_id>")
@@ -82,10 +96,10 @@ def create_app():
         # 부분 수정 허용
         if "title" in data: note.title = data["title"] or ""
         if "content" in data: note.content = data["content"] or ""
-        if "createdDate" in data: note.created_date = data["createdDate"] or ""
+        if "createdDate" in data: note.createdDate = data["createdDate"] or ""
 
         db.session.commit()
-        return jsonify(to_dto(note)), 200
+        return jsonify(to_dto(note))
         
 
     # [D] Delete
@@ -96,11 +110,12 @@ def create_app():
             abort(404, description="Note not found")
         db.session.delete(note)
         db.session.commit()
-        return "", 204
+        return ""
 
     return app
 
 if __name__ == "__main__":
     app = create_app()
+    from waitress import serve
     # 개발 서버
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    app.run(host="0.0.0.0", port=8080)
