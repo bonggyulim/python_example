@@ -1,6 +1,7 @@
 # app.py
 import os
-from flask import Flask, jsonify, request, abort
+import threading
+from flask import Flask, jsonify, request, abort, current_app
 from flask_cors import CORS
 from models import db, Note
 from note_summarize_model import summarize_text
@@ -10,18 +11,18 @@ from sqlalchemy.exc import IntegrityError
 def create_app():
     app = Flask(__name__)
 
-    # 간단히 SQLite 파일 사용 (운영은 별도 DB 권장)
+    # SQLite (개발용)
     db_path = os.environ.get("DB_PATH", "sqlite:///notes.db")
     app.config["SQLALCHEMY_DATABASE_URI"] = db_path
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
     db.init_app(app)
-    CORS(app, resources={r"/notes*": {"origins": "*"}})  # 개발 편의용. 운영에선 origin 제한
+    CORS(app, resources={r"/notes*": {"origins": "*"}})
 
     with app.app_context():
         db.create_all()
 
-    # DTO ↔ 서버 필드 매핑 헬퍼
+    # DTO 변환 (모델: created_date ←→ JSON: createdDate)
     def to_dto(note: Note):
         return {
             "id": note.id,
@@ -29,58 +30,78 @@ def create_app():
             "content": note.content,
             "summarize": note.summarize,
             "sentiment": note.sentiment,
-            "createdDate": note.createdDate # ISO 8601 문자열
+            "createdDate": note.created_date,
         }
 
     # [C] Create
     @app.post("/notes")
     def create_note():
         data = request.get_json(silent=True) or {}
-        data.pop("id", None)  # 클라이언트가 ID를 보내면 무시
-
-        try:
-            summary = summarize_text(data.get("content", "")) or ""
-        except:
-            summary = ""
-
-        try:
-            sentiment = float(classify_sentiment(data.get("content", "")))
-        except:
-            sentiment = 0.0
-        
         note = Note(
             title=data.get("title", ""),
             content=data.get("content", ""),
-            summarize=summary,
-            sentiment=sentiment,
-            createdDate=data.get("createdDate", "")
+            summarize=None,
+            sentiment=None,
+            created_date=data.get("createdDate", ""),
         )
-
         db.session.add(note)
-
         try:
             db.session.commit()
+            # 백그라운드 후처리
+            app_obj = current_app._get_current_object()
+            threading.Thread(
+                target=process_models,
+                args=(app_obj, note.id, note.content),
+                daemon=True,
+            ).start()
         except IntegrityError:
             db.session.rollback()
             return jsonify({"message": "Integrity error"}), 409
-        return jsonify({
-            "id": note.id,  # 서버가 생성한 PK
-            "title": note.title,
-            "content": note.content,
-            "createdDate": note.createdDate
-        })
-        
+        return "", 201
 
-    # [R] Read all (간단 목록)
+    # 백그라운드: 모델 먼저 계산 → 존재할 때만 UPDATE
+    def process_models(app, note_id, content):
+        with app.app_context():
+            try:
+                try:
+                    summary = summarize_text(content or "")
+                except Exception:
+                    summary = None
+                try:
+                    sentiment = classify_sentiment(content or "")
+                except Exception:
+                    sentiment = None
+
+                rows = (
+                    db.session.query(Note)
+                    .filter(Note.id == note_id)
+                    .update(
+                        {"summarize": summary, "sentiment": sentiment},
+                        synchronize_session=False,
+                    )
+                )
+                if rows == 0:
+                    db.session.rollback()
+                    print(f"[bg] note {note_id} not found (deleted?), skip.")
+                    return
+                db.session.commit()
+            except Exception as e:
+                db.session.rollback()
+                print(f"[bg] process_models failed: {e}")
+
+    # [R] Read all
     @app.get("/notes")
     def list_notes():
-        notes = Note.query.order_by(Note.id.desc()).all()
-        return jsonify([to_dto(n) for n in notes])
+        try:
+            notes = db.session.query(Note).order_by(Note.id.desc()).all()
+            return jsonify([to_dto(n) for n in notes]), 200
+        except Exception:
+            return jsonify({"message": "Database error"}), 500
 
-    # [R] Read one
+    # [R] Read one  ← ★ 한 번만 정의!
     @app.get("/notes/<int:note_id>")
     def get_note(note_id: int):
-        note = Note.query.get(note_id)
+        note = db.session.get(Note, note_id)
         if not note:
             abort(404, description="Note not found")
         return jsonify(to_dto(note))
@@ -88,24 +109,25 @@ def create_app():
     # [U] Update
     @app.put("/notes/<int:note_id>")
     def update_note(note_id: int):
-        note = Note.query.get(note_id)
+        note = db.session.get(Note, note_id)
         if not note:
             abort(404, description="Note not found")
 
         data = request.get_json(silent=True) or {}
-        # 부분 수정 허용
-        if "title" in data: note.title = data["title"] or ""
-        if "content" in data: note.content = data["content"] or ""
-        if "createdDate" in data: note.createdDate = data["createdDate"] or ""
+        if "title" in data:
+            note.title = data["title"] or ""
+        if "content" in data:
+            note.content = data["content"] or ""
+        if "createdDate" in data:
+            note.created_date = data["createdDate"] or ""
 
         db.session.commit()
         return jsonify(to_dto(note))
-        
 
     # [D] Delete
     @app.delete("/notes/<int:note_id>")
     def delete_note(note_id: int):
-        note = Note.query.get(note_id)
+        note = db.session.get(Note, note_id)
         if not note:
             abort(404, description="Note not found")
         db.session.delete(note)
@@ -115,7 +137,8 @@ def create_app():
     return app
 
 if __name__ == "__main__":
-    app = create_app()
+    # 개발에서는 app.run, 운영에서는 waitress/gunicorn
+    # app.run(host="0.0.0.0", port=8080)
     from waitress import serve
-    # 개발 서버
-    app.run(host="0.0.0.0", port=8080)
+    app = create_app()
+    serve(app, host="0.0.0.0", port=8080, threads=1)

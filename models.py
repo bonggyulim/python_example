@@ -11,4 +11,4 @@ class Note(db.Model):
     content = db.Column(db.Text, nullable=False, default="")
     summarize = db.Column(db.Text, nullable=False, default="")  # 요약 필드 추가
     sentiment = db.Column(db.Float, nullable=False, default=0.0)  # 감정 점수 필드 추가
-    createdDate = db.Column(db.Text, nullable=False, default="") # ISO 8601 문자열로 저장
+    created_date = db.Column(db.Text, nullable=False, default="") # ISO 8601 문자열로 저장
